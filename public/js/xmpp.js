@@ -557,7 +557,8 @@ class XmppClient {
           .c('x', { xmlns: NS.XDATA, type: 'submit' })
             .c('field', { var: 'FORM_TYPE', type: 'hidden' })
               .c('value').t(NS.MAM).up().up();
-      if (!room) {
+      // With a JID -> conversation history; without -> whole archive (startup sync).
+      if (!room && withJid) {
         query.c('field', { var: 'with' }).c('value').t(withJid).up().up();
       }
       query.up()
@@ -590,6 +591,12 @@ class XmppClient {
         reject(err || new Error('MAM query failed'));
       }, 30000);
     });
+  }
+
+  /** Startup sync: pull the most recent messages from the whole archive so the
+   *  conversation list and recent history populate right after login. */
+  syncRecentHistory({ max = 80 } = {}) {
+    return this.loadHistory(null, { max });
   }
 
   /* -------------------------------- MUC ----------------------------- */

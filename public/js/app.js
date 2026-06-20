@@ -14,6 +14,7 @@ const state = {
   typingTimers: new Map(),  // peer -> timeout for incoming typing reset
   myTyping: { to: null, active: false, idle: null },
   omemo: { ready: false, available: false, deviceId: null, fingerprint: '' },
+  historyBootstrapped: false,
 };
 
 /* ============================ helpers ============================ */
@@ -473,6 +474,8 @@ function wireClient() {
     const banner = $('#conn-banner');
     if (name === 'CONNECTED' || name === 'ATTACHED') {
       banner.hidden = true;
+      // Fallback: load history even if OMEMO events never fire.
+      setTimeout(maybeBootstrapHistory, 3000);
     } else if (name === 'DISCONNECTED' || name === 'CONNFAIL') {
       if (state.currentJid != null) { banner.hidden = false; banner.textContent = 'Соединение потеряно, переподключение…'; }
     }
@@ -578,6 +581,8 @@ function wireClient() {
       const conv = state.conversations.get(state.currentJid);
       if (conv) { ensureOmemoDevices(conv); updateOmemoToggle(conv); }
     }
+    // OMEMO ready -> archive sync can decrypt encrypted messages.
+    maybeBootstrapHistory();
   });
 
   client.on('omemo-error', ({ error }) => {
@@ -590,6 +595,8 @@ function wireClient() {
       const conv = state.conversations.get(state.currentJid);
       if (conv) updateOmemoToggle(conv);
     }
+    // No OMEMO, but plaintext history should still load.
+    maybeBootstrapHistory();
   });
 
   client.on('omemo-devices', ({ jid, devices }) => {
@@ -598,6 +605,31 @@ function wireClient() {
     conv.omemoDevices = devices.length;
     if (state.currentJid === conv.jid) updateOmemoToggle(conv);
   });
+}
+
+function maybeBootstrapHistory() {
+  if (state.historyBootstrapped) return;
+  state.historyBootstrapped = true;
+  bootstrapHistory();
+}
+
+// Pull recent messages from the whole archive so the chat list and history
+// appear right after login (like Cheogram's initial sync).
+async function bootstrapHistory() {
+  try {
+    const res = await client.syncRecentHistory({ max: 80 });
+    for (const m of res.messages) {
+      const conv = getConversation(m.conversation, {
+        type: m.type === 'groupchat' ? 'groupchat' : 'chat',
+      });
+      if (m.encrypted && conv.type !== 'groupchat') conv.encrypted = true;
+      addMessage(conv, m);
+    }
+    renderConversationList();
+    if (state.currentJid) renderActiveMessages('bottom');
+  } catch (e) {
+    console.warn('Не удалось загрузить историю при входе:', e && e.message);
+  }
 }
 
 async function ensureOmemoDevices(conv) {
