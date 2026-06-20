@@ -1,0 +1,26 @@
+{
+  "name": "xmpp-web-client",
+  "version": "1.0.0",
+  "description": "Self-hosted web XMPP client for Prosody (Cheogram-like), connects over WebSocket with login/password",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "build": "node build.js",
+    "start": "node build.js && node server.js",
+    "dev": "node build.js && node --watch server.js",
+    "postinstall": "node build.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@privacyresearch/libsignal-protocol-typescript": "^0.0.16",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "strophe.js": "^1.6.2"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

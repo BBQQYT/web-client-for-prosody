@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#10151b" />
+  <title>XMPP Web</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>" />
+</head>
+<body>
+  <!-- ============ LOGIN ============ -->
+  <div id="login-screen" class="login-screen">
+    <form id="login-form" class="login-card" autocomplete="on">
+      <h1 class="login-title">💬 <span id="app-name">XMPP Web</span></h1>
+      <p class="login-sub">Войдите в свой аккаунт XMPP</p>
+
+      <label class="field">
+        <span>JID (логин)</span>
+        <input id="login-jid" type="text" inputmode="email" autocomplete="username"
+               placeholder="alice@example.com" required />
+      </label>
+
+      <label class="field">
+        <span>Пароль</span>
+        <input id="login-password" type="password" autocomplete="current-password"
+               placeholder="••••••••" required />
+      </label>
+
+      <details id="advanced" class="advanced">
+        <summary>Дополнительно</summary>
+        <label class="field">
+          <span>WebSocket URL сервера</span>
+          <input id="login-ws" type="text" placeholder="wss://example.com:5281/xmpp-websocket" />
+        </label>
+        <label class="checkbox">
+          <input id="login-remember" type="checkbox" />
+          <span>Запомнить логин на этом устройстве</span>
+        </label>
+      </details>
+
+      <button id="login-btn" type="submit" class="btn-primary">Войти</button>
+      <div id="login-error" class="login-error" hidden></div>
+      <div id="login-status" class="login-status" hidden></div>
+    </form>
+    <footer class="login-footer">Самостоятельно размещаемый веб-клиент для Prosody</footer>
+  </div>
+
+  <!-- ============ APP ============ -->
+  <div id="app" class="app" hidden>
+    <!-- Sidebar -->
+    <aside id="sidebar" class="sidebar">
+      <header class="sidebar-head">
+        <div class="me">
+          <div class="avatar" id="me-avatar">?</div>
+          <div class="me-info">
+            <div class="me-jid" id="me-jid">—</div>
+            <select id="presence-select" class="presence-select" title="Статус">
+              <option value="available">🟢 В сети</option>
+              <option value="away">🌙 Отошёл</option>
+              <option value="dnd">⛔ Не беспокоить</option>
+              <option value="xa">💤 Недоступен</option>
+            </select>
+          </div>
+        </div>
+        <div class="sidebar-actions">
+          <button id="add-contact-btn" class="icon-btn" title="Добавить контакт">＋</button>
+          <button id="join-room-btn" class="icon-btn" title="Войти в комнату">#</button>
+          <button id="logout-btn" class="icon-btn" title="Выйти">⏻</button>
+        </div>
+      </header>
+
+      <div class="search-box">
+        <input id="search-input" type="search" placeholder="Поиск контактов…" />
+      </div>
+
+      <nav id="conversation-list" class="conversation-list"></nav>
+      <div id="conn-banner" class="conn-banner" hidden></div>
+    </aside>
+
+    <!-- Chat -->
+    <main id="chat" class="chat">
+      <div id="empty-chat" class="empty-chat">
+        <div class="empty-emoji">💬</div>
+        <p>Выберите чат слева или добавьте контакт</p>
+      </div>
+
+      <section id="chat-view" class="chat-view" hidden>
+        <header class="chat-head">
+          <button id="back-btn" class="icon-btn back-btn" title="Назад">‹</button>
+          <div class="chat-peer">
+            <div class="avatar" id="peer-avatar">?</div>
+            <div>
+              <div class="peer-name" id="peer-name">—</div>
+              <div class="peer-status" id="peer-status"></div>
+            </div>
+          </div>
+          <div class="chat-head-actions">
+            <button id="omemo-toggle" class="icon-btn" title="Шифрование OMEMO" hidden>🔓</button>
+            <button id="contact-info-btn" class="icon-btn" title="Информация">ⓘ</button>
+          </div>
+        </header>
+
+        <div id="messages" class="messages"></div>
+
+        <div id="typing-indicator" class="typing-indicator" hidden></div>
+
+        <form id="composer" class="composer">
+          <button type="button" id="attach-btn" class="icon-btn" title="Прикрепить файл">📎</button>
+          <input type="file" id="file-input" hidden />
+          <textarea id="message-input" class="message-input" rows="1"
+                    placeholder="Сообщение…"></textarea>
+          <button type="submit" id="send-btn" class="icon-btn send-btn" title="Отправить">➤</button>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============ MODALS ============ -->
+  <div id="modal-root"></div>
+
+  <!-- Strophe.js (vendored, self-hosted) -->
+  <script src="/vendor/strophe/strophe.umd.min.js"></script>
+  <!-- OMEMO engine (libsignal port), bundled for the browser -->
+  <script src="/js/omemo.bundle.js"></script>
+  <!-- Runtime config injected by the server -->
+  <script src="/config.js"></script>
+  <!-- App -->
+  <script src="/js/xmpp.js"></script>
+  <script src="/js/ui.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>

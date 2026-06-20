@@ -1,0 +1,67 @@
+-- ============================================================================
+-- Example Prosody configuration snippet for the web client.
+-- Merge the relevant parts into your /etc/prosody/prosody.cfg.lua
+-- (or a file in /etc/prosody/conf.d/). Adjust the domain to yours.
+-- ============================================================================
+
+-- Modules required / recommended for a Cheogram-like web client.
+modules_enabled = {
+    -- generally required
+    "roster";
+    "saslauth";
+    "tls";
+    "dialback";
+    "disco";
+
+    -- needed by THIS web client
+    "websocket";        -- XMPP over WebSocket (RFC 7395) -> wss://host:5281/xmpp-websocket
+    "bosh";             -- optional BOSH fallback        -> https://host:5281/http-bind
+    "mam";              -- XEP-0313 message archive (chat history)
+    "carbons";          -- XEP-0280 multi-device sync
+    "smacks";           -- XEP-0198 stream management (reliable delivery)
+    "csi_simple";       -- client state indication (mobile/battery friendly)
+    "blocklist";
+    "vcard4";
+    "vcard_legacy";
+
+    -- nice to have
+    "version";
+    "ping";
+    "time";
+    "uptime";
+}
+
+-- Archive every 1:1 message by default so history works out of the box.
+default_archive_policy = true
+archive_expires_after = "1w"   -- keep history for a week; tune as you like
+max_archive_query_results = 50
+
+-- Allow the browser to open the WebSocket. If the web client is served from a
+-- DIFFERENT origin than Prosody, you MUST allow that origin via CORS:
+http_cors_override = {
+    websocket = {
+        enabled = true;
+        -- List the exact origin(s) where the web client is hosted:
+        origins = { "https://chat.example.com", "http://localhost:8080" };
+    };
+    bosh = {
+        enabled = true;
+        origins = { "https://chat.example.com", "http://localhost:8080" };
+    };
+}
+
+-- If you terminate TLS at Prosody on the default 5281 port, this is enough.
+-- If you put Prosody behind a reverse proxy that already does TLS, also set:
+-- consider_websocket_secure = true
+-- trusted_proxies = { "127.0.0.1", "::1" }
+
+-- ---------------------------------------------------------------------------
+VirtualHost "example.com"
+    -- File upload (XEP-0363) so users can share images/files from the client.
+    Component "upload.example.com" "http_file_share"
+        http_file_share_size_limit = 20 * 1024 * 1024  -- 20 MB
+
+-- Group chat service (XEP-0045)
+Component "conference.example.com" "muc"
+    modules_enabled = { "muc_mam" }   -- archive group chats too
+    muc_log_by_default = true
