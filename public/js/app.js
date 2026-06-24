@@ -1,6 +1,6 @@
 'use strict';
 
-/* global window, document, XmppClient, UI, CallManager, CSS, crypto, fetch, Blob, URL */
+/* global window, document, XmppClient, UI, CallManager, CSS, crypto, fetch, Blob, File, URL */
 
 const CONFIG = window.APP_CONFIG || {};
 const { $, el } = UI;
@@ -531,19 +531,24 @@ async function handleFileSelected(file) {
   const encrypt = conv.encrypted && type === 'chat' && client.omemoAvailable();
   UI.toast(`Загрузка ${file.name}…`);
   try {
-    const url = await client.uploadFile(file);
-    let sent;
+    let sent, bodyUrl, oobUrl;
     if (encrypt) {
-      // The file itself goes through HTTP upload unencrypted; the link is sent
-      // OMEMO-encrypted. (Full file E2E per XEP-0454 is not implemented.)
-      sent = await client.sendEncryptedMessage(conv.jid, url, { type });
+      // Encrypted chat: encrypt the file itself (XEP-0454) and send an
+      // `aesgcm://` link so Conversations/Cheogram render it inline (a plain
+      // https link inside OMEMO would only show as a clickable URL).
+      bodyUrl = await uploadEncryptedFile(file);
+      oobUrl = '';
+      sent = await client.sendEncryptedMessage(conv.jid, bodyUrl, { type });
     } else {
-      sent = client.sendMessage(conv.jid, url, { type, oobUrl: url });
+      // Plaintext share: body = URL + matching OOB (XEP-0066) for inline display.
+      bodyUrl = await client.uploadFile(file);
+      oobUrl = bodyUrl;
+      sent = client.sendMessage(conv.jid, bodyUrl, { type, oobUrl: bodyUrl });
     }
     if (type !== 'groupchat') {
       addMessage(conv, {
         id: sent.id, originId: sent.originId, from: client.jid, to: conv.jid,
-        type, body: url, oobUrl: encrypt ? '' : url, direction: 'out',
+        type, body: bodyUrl, oobUrl, direction: 'out',
         conversation: conv.jid, ts: sent.ts, encrypted: encrypt,
       }, { optimistic: true });
       renderActiveMessages('bottom');
@@ -553,6 +558,25 @@ async function handleFileSelected(file) {
     UI.toast('Ошибка загрузки файла', true);
     console.error(e);
   }
+}
+
+// Encrypt a file with AES-256-GCM, upload the ciphertext, and return an
+// `aesgcm://host/path#<iv||key-hex>` URL (XEP-0454). The original filename
+// (hence extension) is kept so the receiver knows it's an image.
+async function uploadEncryptedFile(file) {
+  const keyBytes = crypto.getRandomValues(new Uint8Array(32));
+  const ivBytes = crypto.getRandomValues(new Uint8Array(12));
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivBytes }, key, await file.arrayBuffer());
+  const encFile = new File([ct], file.name, { type: 'application/octet-stream' });
+  const getUrl = await client.uploadFile(encFile);
+  // Show our own image instantly (we still hold the plaintext) without a fetch.
+  try { decryptedBlobCache.set(getUrl, URL.createObjectURL(file)); } catch (_) { /* ignore */ }
+  return getUrl.replace(/^https?:/i, 'aesgcm:') + '#' + bytesToHex(ivBytes) + bytesToHex(keyBytes);
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (x) => x.toString(16).padStart(2, '0')).join('');
 }
 
 /* ============================ notifications ============================ */

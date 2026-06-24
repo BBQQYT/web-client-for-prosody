@@ -237,8 +237,9 @@ the chat header for direct chats.
   be decrypted from the server archive — they show as 🔒 *не удалось
   расшифровать*. Messages received while this device is active decrypt fine and
   are cached locally for future reloads.
-- **OMEMO files:** the file is uploaded to HTTP Upload unencrypted; only the link
-  is sent encrypted (full file E2E per XEP-0454 is not implemented).
+- **OMEMO files:** in encrypted chats files are now AES-256-GCM encrypted before
+  upload and shared as `aesgcm://` links (XEP-0454); the upload host only ever
+  stores ciphertext.
 - OMEMO is 1:1 only (not used in MUC).
 - If you change your XMPP password, the local OMEMO key store can no longer be
   unlocked and a new device identity is generated.
@@ -247,9 +248,10 @@ the chat header for direct chats.
 - Calls are 1:1 only. They use Jingle (XEP-0166/0353) and should interoperate
   with Conversations/Dino, but the SDP↔Jingle mapping is best-effort — verify
   with your actual peer and check the `[jingle]` console logs if a call fails.
-- Sending **outgoing** files is not yet end-to-end encrypted (`aesgcm://`):
-  incoming OMEMO `aesgcm://` attachments are fetched & decrypted for display, but
-  this client uploads its own shared files unencrypted (link sent over OMEMO).
+- In an **encrypted** chat, shared files are now end-to-end encrypted: the file
+  is AES-256-GCM encrypted before upload and sent as an `aesgcm://` link
+  (XEP-0454), so Conversations/Cheogram render it inline. In a **plaintext** chat
+  the file is uploaded as-is with an OOB link (XEP-0066).
 
 ## License
 
