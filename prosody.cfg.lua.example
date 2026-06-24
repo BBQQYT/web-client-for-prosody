@@ -48,6 +48,14 @@ http_cors_override = {
         enabled = true;
         origins = { "https://chat.example.com", "http://localhost:8080" };
     };
+    -- REQUIRED for the client to fetch & decrypt OMEMO `aesgcm://` attachments
+    -- (XEP-0454) when the upload host is a different origin than the web client.
+    -- Without this, the cross-origin fetch is blocked and encrypted images can't
+    -- be shown. (Not needed if upload is served from the same origin.)
+    file_share = {
+        enabled = true;
+        origins = { "https://chat.example.com", "http://localhost:8080" };
+    };
 }
 
 -- If you terminate TLS at Prosody on the default 5281 port, this is enough.

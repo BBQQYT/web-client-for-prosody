@@ -1,6 +1,6 @@
 'use strict';
 
-/* global window, document, XmppClient, UI, CallManager, CSS */
+/* global window, document, XmppClient, UI, CallManager, CSS, crypto, fetch, Blob, URL */
 
 const CONFIG = window.APP_CONFIG || {};
 const { $, el } = UI;
@@ -91,6 +91,7 @@ function msgKey(m) {
 
 function previewText(m) {
   if (m.oobUrl) return '📎 Вложение';
+  if (m.body && /^aesgcm:\/\//i.test(m.body.trim())) return '🔒 Вложение';
   return m.body || '';
 }
 
@@ -212,9 +213,15 @@ function renderBubble(conv, m, groupedTop) {
   if (conv.type === 'groupchat' && m.direction === 'in' && groupedTop) {
     bubble.appendChild(el('div', { class: 'msg-sender' }, m.nick || m.from));
   }
-  bubble.appendChild(el('div', { class: 'msg-body', html: UI.linkify(m.body) }));
-  const imgUrl = UI.imageUrl(m.body, m.oobUrl);
-  if (imgUrl) bubble.appendChild(renderImageLoader(imgUrl));
+  const aes = UI.aesgcmInfo(m.body, m.oobUrl);
+  if (aes) {
+    bubble.appendChild(el('div', { class: 'msg-body' }, aes.isImage ? '🔒 Зашифрованное изображение' : '🔒 Зашифрованный файл'));
+    bubble.appendChild(renderEncryptedAttachment(aes));
+  } else {
+    bubble.appendChild(el('div', { class: 'msg-body', html: UI.linkify(m.body) }));
+    const imgUrl = UI.imageUrl(m.body, m.oobUrl);
+    if (imgUrl) bubble.appendChild(renderImageLoader(imgUrl));
+  }
   bubble.appendChild(meta);
   return bubble;
 }
@@ -225,12 +232,76 @@ function renderImageLoader(url) {
   const wrap = el('div', { class: 'img-loader' });
   const btn = el('button', { class: 'img-load-btn', type: 'button' }, '🖼 Показать изображение');
   btn.addEventListener('click', () => {
-    const img = el('img', { class: 'inline-img', src: url, alt: 'image', loading: 'lazy' });
-    img.addEventListener('click', () => window.open(url, '_blank', 'noopener'));
-    wrap.replaceChildren(img);
+    wrap.replaceChildren(makeInlineImg(url));
   });
   wrap.appendChild(btn);
   return wrap;
+}
+
+/* ---- aesgcm:// (XEP-0454) encrypted attachments ---- */
+
+const decryptedBlobCache = new Map(); // httpsUrl -> object URL
+
+function renderEncryptedAttachment(aes) {
+  const wrap = el('div', { class: 'img-loader' });
+  const cached = decryptedBlobCache.get(aes.httpsUrl);
+  if (cached && aes.isImage) { wrap.appendChild(makeInlineImg(cached)); return wrap; }
+
+  const btn = el('button', { class: 'img-load-btn', type: 'button' },
+    aes.isImage ? '🔒 Показать изображение' : `🔒 Расшифровать ${aes.name}`);
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    btn.textContent = 'Расшифровка…';
+    try {
+      const buf = await decryptAesgcm(aes);
+      const url = URL.createObjectURL(new Blob([buf], { type: mimeFromUrl(aes.httpsUrl) }));
+      decryptedBlobCache.set(aes.httpsUrl, url);
+      if (aes.isImage) {
+        wrap.replaceChildren(makeInlineImg(url));
+      } else {
+        wrap.replaceChildren(el('a', { class: 'file-link', href: url, download: aes.name }, `⬇️ ${aes.name}`));
+      }
+    } catch (e) {
+      console.warn('aesgcm load/decrypt failed', e);
+      btn.disabled = false;
+      btn.textContent = '⚠️ Не удалось загрузить (CORS на upload-сервере?)';
+    }
+  });
+  wrap.appendChild(btn);
+  return wrap;
+}
+
+function makeInlineImg(url) {
+  const img = el('img', { class: 'inline-img', alt: 'image', loading: 'lazy' });
+  img.src = url;
+  img.addEventListener('click', () => window.open(url, '_blank', 'noopener'));
+  return img;
+}
+
+async function decryptAesgcm(aes) {
+  const resp = await fetch(aes.httpsUrl);
+  if (!resp.ok) throw new Error('http ' + resp.status);
+  const ct = await resp.arrayBuffer();
+  const key = await crypto.subtle.importKey('raw', hexToBytes(aes.keyHex), { name: 'AES-GCM' }, false, ['decrypt']);
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv: hexToBytes(aes.ivHex) }, key, ct);
+}
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+function mimeFromUrl(url) {
+  const ext = (url.split('#')[0].split('?')[0].split('.').pop() || '').toLowerCase();
+  const map = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+    webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml',
+    mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+    mp3: 'audio/mpeg', ogg: 'audio/ogg', oga: 'audio/ogg', wav: 'audio/wav',
+    pdf: 'application/pdf', txt: 'text/plain',
+  };
+  return map[ext] || 'application/octet-stream';
 }
 
 function updateMessageStatus(conv, key, status) {

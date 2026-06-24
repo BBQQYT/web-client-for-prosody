@@ -33,6 +33,7 @@ const UI = (() => {
   const URL_RE = /\bhttps?:\/\/[^\s<>"']+/gi;
   const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/i;
   const SINGLE_URL_RE = /^https?:\/\/[^\s<>"']+$/i;
+  const AESGCM_RE = /\baesgcm:\/\/[^\s<>"']+/i;
 
   // Escape, then turn http(s) URLs into safe links. All HTML-significant chars
   // are escaped BEFORE linkifying, so nothing can break out of the href or the
@@ -54,6 +55,32 @@ const UI = (() => {
     const t = (text || '').trim();
     if (SINGLE_URL_RE.test(t) && IMG_RE.test(t)) return t;
     return '';
+  }
+
+  // Parse an OMEMO/OX encrypted media link (XEP-0454 `aesgcm://host/path#<hex>`,
+  // as sent by Conversations/Cheogram). The fragment is IV||KEY in hex: the last
+  // 32 bytes are the AES-256 key, the rest (12 or 16 bytes) is the GCM IV. The
+  // file at the https:// URL is the ciphertext with the 16-byte tag appended.
+  function aesgcmInfo(text, oobUrl) {
+    let src = (oobUrl || '').trim();
+    if (!/^aesgcm:\/\//i.test(src)) {
+      const m = (text || '').trim().match(AESGCM_RE);
+      src = m ? m[0] : '';
+    }
+    if (!src) return null;
+    const hash = src.indexOf('#');
+    if (hash < 0) return null;
+    const frag = src.slice(hash + 1);
+    if (!/^[0-9a-f]+$/i.test(frag) || (frag.length !== 88 && frag.length !== 96)) return null;
+    const ivLen = frag.length - 64;
+    const urlPart = src.slice(0, hash);
+    return {
+      httpsUrl: urlPart.replace(/^aesgcm:/i, 'https:'),
+      ivHex: frag.slice(0, ivLen),
+      keyHex: frag.slice(ivLen),
+      isImage: IMG_RE.test(urlPart),
+      name: decodeURIComponent((urlPart.split('/').pop() || 'file').split('?')[0]),
+    };
   }
 
   function initials(name) {
@@ -156,7 +183,7 @@ const UI = (() => {
   }
 
   return {
-    $, $$, el, escapeHtml, linkify, imageUrl, initials, formatTime, formatDay, dayKey,
+    $, $$, el, escapeHtml, linkify, imageUrl, aesgcmInfo, initials, formatTime, formatDay, dayKey,
     toast, modalForm, confirm,
   };
 })();

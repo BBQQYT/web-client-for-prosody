@@ -304,6 +304,8 @@ input, textarea, select { font-family: inherit; }
   font-size: 13px;
 }
 .img-load-btn:hover { color: var(--text); }
+.file-link { display: inline-block; color: #9cd1ff; text-decoration: none; padding: 4px 0; }
+.file-link:hover { text-decoration: underline; }
 .msg-meta {
   display: flex; align-items: center; gap: 5px; justify-content: flex-end;
   font-size: 10.5px; color: var(--text-faint); margin-top: 3px;
