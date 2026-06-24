@@ -98,7 +98,12 @@ class CallManager {
     }
 
     // Another of OUR devices answered/declined this incoming call -> stop ringing.
-    if (mine && (action === 'accept' || action === 'reject') && this.call && this.call.sid === sid && this.call.direction === 'in') {
+    // Ignore the echo of the very `accept` WE just sent to our own bare JID
+    // (same resource, or while we are the one answering) — otherwise accepting a
+    // call would instantly cancel it.
+    if (mine && (action === 'accept' || action === 'reject') &&
+        this.call && this.call.sid === sid && this.call.direction === 'in' &&
+        !this.call.answering && from !== this.client.jid) {
       this._end('');
       return;
     }
@@ -161,6 +166,7 @@ class CallManager {
     if (!this.call || this.call.direction !== 'in') return;
     this._clearRingTimeout();
     this.call.state = 'connecting';
+    this.call.answering = true; // so our own JMI <accept> echo doesn't cancel us
     try {
       await this._getLocalMedia(this.call.video);
     } catch (e) { this._fail(e); return; }
@@ -281,10 +287,23 @@ class CallManager {
   /* --------------------------- media / pc --------------------------- */
 
   async _getLocalMedia(video) {
-    this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: !!video });
+    try {
+      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: !!video });
+    } catch (e) {
+      // No camera / camera blocked: gracefully fall back to an audio-only call
+      // instead of failing the whole call. Re-throw only if audio also fails.
+      if (video) {
+        log('camera unavailable, falling back to audio-only:', e && e.name);
+        this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        if (this.call) this.call.video = false;
+        this.ui.toast('Камера недоступна — звонок без видео');
+      } else {
+        throw e;
+      }
+    }
     if (this.localVideo) {
       this.localVideo.srcObject = this.localStream;
-      this.localVideo.hidden = !video;
+      this.localVideo.hidden = !(this.call && this.call.video);
     }
   }
 
