@@ -14,7 +14,11 @@
  */
 
 const subtle = globalThis.crypto.subtle;
-const PBKDF2_ITERS = 150000;
+// OWASP-aligned iteration count for PBKDF2-HMAC-SHA256. The count actually used
+// is stored alongside the blob so older stores (150k) still decrypt after an
+// upgrade; only re-encrypts (saves) use the current value.
+const PBKDF2_ITERS = 600000;
+const PBKDF2_ITERS_LEGACY = 150000;
 
 function ab2b64(buf) {
   const b = new Uint8Array(buf);
@@ -46,10 +50,10 @@ function abEqual(a, b) {
   return true;
 }
 
-async function deriveKey(password, salt) {
+async function deriveKey(password, salt, iterations = PBKDF2_ITERS) {
   const base = await subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
   return subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERS, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     base,
     { name: 'AES-GCM', length: 256 },
     false,
@@ -81,6 +85,7 @@ class OmemoStore {
     this.data = emptyData();
     this.salt = null;
     this.cryptoKey = null;
+    this.iters = PBKDF2_ITERS; // iteration count the current cryptoKey was derived with
     this._saveTimer = null;
   }
 
@@ -91,13 +96,16 @@ class OmemoStore {
     const raw = localStorage.getItem(this.lsKey);
     if (!raw) {
       this.salt = globalThis.crypto.getRandomValues(new Uint8Array(16));
-      this.cryptoKey = await deriveKey(password, this.salt);
+      this.iters = PBKDF2_ITERS;
+      this.cryptoKey = await deriveKey(password, this.salt, this.iters);
       this.data = emptyData();
       return false;
     }
     const obj = JSON.parse(raw);
     this.salt = new Uint8Array(b64ab(obj.salt));
-    this.cryptoKey = await deriveKey(password, this.salt);
+    // Older blobs predate the `iter` field and used the legacy iteration count.
+    const iters = obj.iter || PBKDF2_ITERS_LEGACY;
+    this.cryptoKey = await deriveKey(password, this.salt, iters);
     try {
       const pt = await subtle.decrypt(
         { name: 'AES-GCM', iv: new Uint8Array(b64ab(obj.iv)) },
@@ -105,6 +113,14 @@ class OmemoStore {
         b64ab(obj.ct)
       );
       this.data = this._deserialize(JSON.parse(new TextDecoder().decode(pt)));
+      this.iters = iters;
+      // Transparently upgrade legacy (low-iteration) stores: re-derive at the
+      // current strength and persist on the next save.
+      if (iters < PBKDF2_ITERS) {
+        this.cryptoKey = await deriveKey(password, this.salt, PBKDF2_ITERS);
+        this.iters = PBKDF2_ITERS;
+        await this.save();
+      }
       return true;
     } catch (e) {
       throw new Error('omemo-locked');
@@ -124,6 +140,7 @@ class OmemoStore {
     const ct = await subtle.encrypt({ name: 'AES-GCM', iv }, this.cryptoKey, new TextEncoder().encode(ser));
     localStorage.setItem(this.lsKey, JSON.stringify({
       v: 1,
+      iter: this.iters,
       salt: ab2b64(this.salt.buffer || this.salt),
       iv: ab2b64(iv.buffer),
       ct: ab2b64(ct),
@@ -178,9 +195,13 @@ class OmemoStore {
 
   async saveIdentity(addr, key) {
     const prev = this.data.identities[addr];
+    const changed = !!(prev && !abEqual(prev, key));
     this.data.identities[addr] = key;
     this.scheduleSave();
-    return !!(prev && !abEqual(prev, key));
+    if (changed && typeof this.onIdentityChange === 'function') {
+      try { this.onIdentityChange(addr, key); } catch (_) { /* ignore */ }
+    }
+    return changed;
   }
 
   async loadPreKey(id) { return this.data.preKeys[id]; }

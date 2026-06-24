@@ -16,10 +16,12 @@ it never sees credentials.
 - ✓✓ Delivery receipts (XEP-0184) + read markers (XEP-0333)
 - ✍️ Typing indicators (XEP-0085)
 - ➕ Add contacts / accept subscription requests (RFC 6121)
-- 👥 Group chat / MUC (XEP-0045), basic join + history
-- 📎 File & image sharing via HTTP Upload (XEP-0363)
-- 🔒 **OMEMO end-to-end encryption** (XEP-0384, legacy `axolotl` — Conversations/Cheogram compatible) with per-chat lock toggle, fingerprints and trust-on-first-use
+- 👥 **Group chat / MUC** (XEP-0045): join, live occupant list & count, room subject/topic, auto-rejoin saved rooms after reload
+- 📞 **Audio / video calls** (1:1, WebRTC) with STUN/TURN, mute & camera toggle
+- 📎 File & image sharing via HTTP Upload (XEP-0363); shared images are click-to-load (no IP/read leak)
+- 🔒 **OMEMO end-to-end encryption** (XEP-0384, legacy `axolotl` — Conversations/Cheogram compatible) with per-chat lock toggle, fingerprints, trust-on-first-use, and identity-key-change warnings
 - 🔁 Auto-reconnect with backoff
+- 🛡️ Strict Content-Security-Policy + security headers; carbon/MAM anti-forgery checks
 - 📲 Responsive layout (works on phones), dark theme, desktop notifications
 
 ## Quick start
@@ -49,6 +51,9 @@ the WebSocket URL under **"Дополнительно"** on the login screen.
 | `XMPP_BOSH_URL`       | Optional BOSH fallback endpoint                                    |
 | `XMPP_DEFAULT_DOMAIN` | Lets users log in with just `alice` instead of `alice@example.com` |
 | `XMPP_MUC_SERVICE`    | Default MUC service for the "join room" dialog                     |
+| `XMPP_STUN_URL`       | STUN server for calls (default: Google public STUN)               |
+| `XMPP_TURN_URL`       | Optional TURN relay for calls behind symmetric NAT / firewalls     |
+| `XMPP_TURN_USER` / `XMPP_TURN_CRED` | TURN credentials                                    |
 
 ## Prosody setup
 
@@ -136,6 +141,8 @@ Browser (public/)  ──WebSocket(SASL)──►  Prosody (mod_websocket)
   implementing the XEPs listed above.
 - `public/js/app.js` — application state + glue between XMPP events and the DOM.
 - `public/js/ui.js` — pure view helpers (DOM building, modals, toasts).
+- `public/js/calls.js` — `CallManager`: WebRTC audio/video calls with signaling
+  over XMPP messages.
 - `omemo/` — OMEMO sources bundled by `build.js` (esbuild) into
   `public/js/omemo.bundle.js`:
   - `omemo/store.js` — encrypted, on-device libsignal store (localStorage + AES-GCM).
@@ -154,8 +161,9 @@ How it satisfies "nothing stored on the server":
 - All **secret** key material — identity key, prekeys, signed prekeys, Double
   Ratchet session state, peer identities — is stored **only on the device**, in
   `localStorage`, **encrypted at rest** with AES-256-GCM. The encryption key is
-  derived from your XMPP password via PBKDF2 (150k iterations). Without the
-  password the local store cannot be read.
+  derived from your XMPP password via PBKDF2 (600k iterations; older 150k stores
+  are upgraded transparently on next unlock). Without the password the local
+  store cannot be read.
 - The only thing published to the server is your **public OMEMO bundle**
   (identity public key + prekeys) via PEP. This is public key material by design
   — contacts need it to start an encrypted session with you. No private keys and
@@ -175,11 +183,40 @@ Using it:
 Prosody requirements: PEP must be enabled (mod_pep, on by default). Bundles are
 published with `access_model=open` so contacts can fetch them.
 
+## Audio / video calls
+
+1:1 calls use **WebRTC** for peer-to-peer media (audio and optional video), so
+the media never flows through the web server. Call buttons (📞 / 🎥) appear in
+the chat header for direct chats.
+
+- **Signaling** rides on XMPP messages (namespace `urn:xmppweb:call:0`): propose →
+  accept/reject → SDP offer/answer → trickle ICE → hangup. These signaling
+  messages are hinted *no-store / no-copy* so they aren't archived.
+- This signaling is **app-native** — it works between users of *this* client, but
+  is **not Jingle (XEP-0166/0353)**, so it does not interoperate with
+  Conversations/Dino/Movim. (Swapping in Jingle is a possible future step.)
+- **NAT traversal:** a public STUN server is used by default; set `XMPP_TURN_URL`
+  (+ credentials) for symmetric NATs / strict firewalls.
+- Requires a **secure context** (HTTPS, or `http://localhost`) for camera/mic
+  access. The buttons are hidden if the browser can't do WebRTC.
+
 ## Security notes
 
 - Always serve over **HTTPS/WSS** in production. Browsers block `wss://` from an
   `https://` page only if certs are invalid, and block insecure `ws://` from
-  secure pages entirely.
+  secure pages entirely. WebRTC calls also require a secure context.
+- The server sends a strict **Content-Security-Policy** plus `X-Frame-Options:
+  DENY` (anti-clickjacking), `X-Content-Type-Options`, `Referrer-Policy:
+  no-referrer`, and a `Permissions-Policy` limiting camera/mic to same-origin.
+- **Carbon/MAM anti-forgery:** incoming Message Carbons are accepted only when the
+  outer stanza is from your own bare JID, and MAM results only from the archive
+  actually queried (your account or the queried room). This blocks a federated
+  peer from injecting spoofed messages into your history (XEP-0280 §6).
+- **OMEMO identity-key changes** are surfaced as a warning and the affected device
+  is marked untrusted (so you stop encrypting to it) until you re-verify its
+  fingerprint via the ⓘ panel. First-seen devices remain trust-on-first-use.
+- **Shared images are not auto-loaded** — a click is required — so a sender can't
+  use a remote image as a tracking pixel to learn your IP or that you saw it.
 - Credentials are kept in memory only; "remember me" stores **just the JID and
   WebSocket URL** in `localStorage`, never the password.
 - This server does not proxy XMPP traffic, so it has no access to messages.
@@ -199,8 +236,10 @@ published with `access_model=open` so contacts can fetch them.
 - OMEMO is 1:1 only (not used in MUC).
 - If you change your XMPP password, the local OMEMO key store can no longer be
   unlocked and a new device identity is generated.
-- MUC support is basic (join, history, send/receive); no member lists / affiliations UI.
-- No voice/video calls.
+- MUC: join/history/send/receive, occupant count and subject are supported; there
+  is no full member-list / affiliation-management UI yet.
+- Calls are 1:1 only and use app-native signaling (not Jingle), so they don't
+  interoperate with other XMPP clients.
 
 ## License
 

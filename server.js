@@ -40,7 +40,51 @@ const clientConfig = {
 
   // Default MUC (group chat) service, e.g. conference.example.com
   mucService: process.env.XMPP_MUC_SERVICE || '',
+
+  // ICE servers for WebRTC audio/video calls. A public STUN server is enough
+  // for most NATs; add a TURN server for symmetric NATs / strict firewalls.
+  iceServers: buildIceServers(),
 };
+
+// Build the ICE server list from env (STUN is always included as a fallback).
+function buildIceServers() {
+  const servers = [{ urls: process.env.XMPP_STUN_URL || 'stun:stun.l.google.com:19302' }];
+  if (process.env.XMPP_TURN_URL) {
+    const turn = { urls: process.env.XMPP_TURN_URL };
+    if (process.env.XMPP_TURN_USER) turn.username = process.env.XMPP_TURN_USER;
+    if (process.env.XMPP_TURN_CRED) turn.credential = process.env.XMPP_TURN_CRED;
+    servers.push(turn);
+  }
+  return servers;
+}
+
+// Security headers. The client renders message content into the DOM and runs
+// E2E crypto, so a strict CSP is valuable defense-in-depth, and frame-ancestors
+// blocks click-jacking / UI-redress against the chat UI.
+app.use((req, res, next) => {
+  res.set(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      "form-action 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: https:",
+      "media-src 'self' blob:",
+      // wss/ws: user-configured XMPP WebSocket; https: HTTP file upload (XEP-0363).
+      "connect-src 'self' https: wss: ws:",
+      "font-src 'self'",
+    ].join('; ')
+  );
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
+  next();
+});
 
 // Expose config to the browser as a global `window.APP_CONFIG`.
 app.get('/config.js', (req, res) => {

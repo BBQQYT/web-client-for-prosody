@@ -45,6 +45,8 @@ const NS = {
   PUBSUB_OPTIONS: 'http://jabber.org/protocol/pubsub#publish-options',
   EME: 'urn:xmpp:eme:0',
   HINTS: 'urn:xmpp:hints',
+  // App-native WebRTC call signaling (between users of this web client).
+  CALL: 'urn:xmppweb:call:0',
   // OMEMO (legacy axolotl — Conversations / Cheogram compatible)
   AXOLOTL: 'eu.siacs.conversations.axolotl',
   OMEMO_DEVICELIST: 'eu.siacs.conversations.axolotl.devicelist',
@@ -128,9 +130,9 @@ class XmppClient {
   _openConnection() {
     const { jid, password, wsUrl } = this._creds;
     this.connection = new Strophe.Connection(wsUrl, { keepalive: true });
-    // Surface raw traffic in the console for debugging.
-    this.connection.rawInput = (data) => this._emit('raw', { dir: 'in', data });
-    this.connection.rawOutput = (data) => this._emit('raw', { dir: 'out', data });
+    // NOTE: we deliberately do NOT install rawInput/rawOutput hooks — they would
+    // surface the SASL <auth> stanza (which base64-encodes the password) and all
+    // message plaintext to listeners/console. Keep credentials out of events.
 
     this.connection.connect(jid, password, (status, condition) => {
       this._onStatus(status, condition);
@@ -172,6 +174,7 @@ class XmppClient {
     this.enableCarbons();
     this.sendPresence();
     this.getRoster();
+    this._rejoinRooms();
     this.discoverUploadService().catch(() => {});
     this.initOmemo().catch((e) => {
       console.warn('[omemo] init failed', e && e.message);
@@ -216,6 +219,16 @@ class XmppClient {
     return Strophe.getBareJidFromJid(jid) === this.bareJid;
   }
 
+  /** Whether a MAM result's `from` is allowed to populate a given query's
+   *  collector. Empty `from` = our own server acting for the account. */
+  _isAllowedArchive(stanzaFrom, archiveJid) {
+    if (!stanzaFrom) return true;
+    const bare = Strophe.getBareJidFromJid(stanzaFrom);
+    if (bare === this.bareJid) return true;
+    if (archiveJid && bare === Strophe.getBareJidFromJid(archiveJid)) return true;
+    return false;
+  }
+
   /* ----------------------------- presence --------------------------- */
 
   sendPresence(show, statusText) {
@@ -246,10 +259,23 @@ class XmppClient {
 
     const x = getChild(stanza, 'x', NS.MUC_USER);
     if (x || this._rooms.has(Strophe.getBareJidFromJid(from))) {
+      const item = x ? getChild(x, 'item') : null;
+      const statusCodes = x ? getChildren(x, 'status').map((s) => s.getAttribute('code')) : [];
+      let newNick = '';
+      if (statusCodes.includes('303') && item) newNick = item.getAttribute('nick') || '';
+      const showEl = getChild(stanza, 'show');
       this._emit('muc-presence', {
         room: Strophe.getBareJidFromJid(from),
         nick: Strophe.getResourceFromJid(from),
         type: type || 'available',
+        role: item ? (item.getAttribute('role') || '') : '',
+        affiliation: item ? (item.getAttribute('affiliation') || '') : '',
+        jid: item ? (item.getAttribute('jid') || '') : '',
+        show: showEl ? Strophe.getText(showEl) : '',
+        self: statusCodes.includes('110'),
+        created: statusCodes.includes('201'),
+        nickChange: statusCodes.includes('303'),
+        newNick,
       });
       return true;
     }
@@ -334,6 +360,15 @@ class XmppClient {
 
   _onMessage(stanza) {
     try {
+      const stanzaFrom = stanza.getAttribute('from') || '';
+
+      // --- WebRTC call signaling (app-native) ---
+      const callEl = getChild(stanza, 'call', NS.CALL);
+      if (callEl) {
+        this._handleCallSignal(stanzaFrom, callEl);
+        return true;
+      }
+
       // --- PEP event (OMEMO device list updates) ---
       const event = getChild(stanza, 'event', NS.PUBSUB_EVENT);
       if (event) {
@@ -346,6 +381,12 @@ class XmppClient {
       if (result) {
         const qid = result.getAttribute('queryid');
         const collector = this._mamCollectors.get(qid);
+        // Anti-forgery (XEP-0313): only trust a MAM result that comes from the
+        // archive we actually queried — our own bare JID for 1:1 sync, or the
+        // room JID for MUC. A bare/empty `from` means the account's own server.
+        if (collector && !this._isAllowedArchive(stanzaFrom, collector.archiveJid)) {
+          return true;
+        }
         const fwd = getChild(result, 'forwarded', NS.FORWARD);
         const inner = getChild(fwd, 'message');
         const delay = getChild(fwd, 'delay', NS.DELAY);
@@ -372,11 +413,30 @@ class XmppClient {
       const recv = getChild(stanza, 'received', NS.CARBONS);
       const sent = getChild(stanza, 'sent', NS.CARBONS);
       if (recv || sent) {
+        // Anti-forgery (XEP-0280 §6): a carbon is only legitimate if the OUTER
+        // message comes from our own bare JID (or has no `from`, i.e. the server
+        // acting for our account — a value a remote peer cannot forge, since the
+        // server stamps their real JID). Otherwise a remote contact could wrap a
+        // forged <message from='someone-else'> in a fake carbon and inject it
+        // into our history. Drop it.
+        if (stanzaFrom && !this._isMe(stanzaFrom)) return true;
         const fwd = getChild(recv || sent, 'forwarded', NS.FORWARD);
         const inner = getChild(fwd, 'message');
         if (!inner) return true;
         carbonDir = recv ? 'in' : 'out';
         target = inner;
+      }
+
+      // --- MUC room subject (topic) ---
+      const subjectEl = getChild(target, 'subject');
+      if (subjectEl && !getChild(target, 'body') && target.getAttribute('type') === 'groupchat') {
+        const rfrom = target.getAttribute('from') || '';
+        this._emit('muc-subject', {
+          room: Strophe.getBareJidFromJid(rfrom),
+          subject: Strophe.getText(subjectEl),
+          by: Strophe.getResourceFromJid(rfrom),
+        });
+        return true;
       }
 
       // --- OMEMO encrypted message ---
@@ -549,7 +609,7 @@ class XmppClient {
   loadHistory(withJid, { before = null, max = 40, room = false } = {}) {
     return new Promise((resolve, reject) => {
       const queryid = 'mam-' + this._id();
-      const collected = { messages: [], pending: [] };
+      const collected = { messages: [], pending: [], archiveJid: room ? withJid : this.bareJid };
       this._mamCollectors.set(queryid, collected);
 
       const query = $iq(room ? { type: 'set', to: withJid } : { type: 'set' })
@@ -603,16 +663,34 @@ class XmppClient {
 
   joinRoom(roomJid, nick) {
     this._rooms.set(roomJid, nick);
+    this._sendJoinPresence(roomJid, nick);
+  }
+
+  _sendJoinPresence(roomJid, nick) {
     const p = $pres({ to: `${roomJid}/${nick}` })
       .c('x', { xmlns: NS.MUC })
       .c('history', { maxstanzas: '30' });
     this.connection.send(p);
   }
 
+  /** Re-send join presence for every joined room after a (re)connect. */
+  _rejoinRooms() {
+    for (const [roomJid, nick] of this._rooms) this._sendJoinPresence(roomJid, nick);
+  }
+
+  /** Currently joined rooms as [{ jid, nick }] — used to persist/restore. */
+  joinedRooms() {
+    return [...this._rooms].map(([jid, nick]) => ({ jid, nick }));
+  }
+
   leaveRoom(roomJid) {
     const nick = this._rooms.get(roomJid);
     if (nick) this.connection.send($pres({ to: `${roomJid}/${nick}`, type: 'unavailable' }));
     this._rooms.delete(roomJid);
+  }
+
+  setRoomSubject(roomJid, subject) {
+    this.connection.send($msg({ to: roomJid, type: 'groupchat' }).c('subject').t(subject).tree());
   }
 
   isRoom(jid) {
@@ -705,6 +783,9 @@ class XmppClient {
       jid: this.bareJid,
       password: this._creds.password,
       bundleFetcher: (jid, dev) => this._cachedFetchBundle(jid, dev),
+      // Surface identity-key changes (a possible MITM / device reinstall) so the
+      // UI can warn the user instead of silently accepting the new key.
+      onKeyChange: (info) => this._emit('omemo-key-changed', info),
     });
     this.omemoReady = true;
     await this.publishBundle();
@@ -970,6 +1051,30 @@ class XmppClient {
     if (base.direction === 'in' && base.id && base.type !== 'groupchat') {
       this.sendReceipt(base.from, base.id, base.type);
     }
+  }
+
+  /* ------------------------------ calls ----------------------------- */
+
+  /**
+   * Send a WebRTC signaling message. `to` may be a bare JID (propose — rings all
+   * the callee's devices) or a full JID (media negotiation with one device).
+   * Call signals are transient: hint the server not to store or carbon them.
+   */
+  sendCallSignal(to, action, data = {}) {
+    if (!this.isConnected()) return;
+    const msg = $msg({ to, type: 'chat' })
+      .c('call', { xmlns: NS.CALL, action }).t(JSON.stringify(data || {})).up()
+      .c('no-store', { xmlns: NS.HINTS }).up()
+      .c('no-copy', { xmlns: NS.HINTS }).up()
+      .c('no-permanent-store', { xmlns: NS.HINTS }).up();
+    this.connection.send(msg.tree());
+  }
+
+  _handleCallSignal(from, callEl) {
+    const action = callEl.getAttribute('action') || '';
+    let data = {};
+    try { data = JSON.parse(Strophe.getText(callEl) || '{}'); } catch (_) { data = {}; }
+    this._emit('call-signal', { from, action, data });
   }
 
   /* ----------------------------- version ---------------------------- */

@@ -43,10 +43,23 @@ class OmemoEngine {
     this.accountJid = null;
   }
 
-  async init({ jid, password, bundleFetcher }) {
+  async init({ jid, password, bundleFetcher, onKeyChange }) {
     this.accountJid = jid;
     this.bundleFetcher = bundleFetcher;
+    this.onKeyChange = typeof onKeyChange === 'function' ? onKeyChange : null;
     this.store = new OmemoStore(jid);
+    // When libsignal replaces a peer's identity key with a DIFFERENT one, mark
+    // that device untrusted (so we stop encrypting to it until re-verified) and
+    // notify the app. New, first-seen devices stay TOFU-trusted.
+    this.store.onIdentityChange = (addr) => {
+      const idx = addr.lastIndexOf('.');
+      const peerJid = addr.slice(0, idx);
+      const deviceId = Number(addr.slice(idx + 1));
+      this.setTrust(peerJid, deviceId, false);
+      if (this.onKeyChange) {
+        try { this.onKeyChange({ jid: peerJid, deviceId }); } catch (_) { /* ignore */ }
+      }
+    };
     const existed = await this.store.load(password); // throws 'omemo-locked' on bad password
     if (!existed || !this.store.data.identityKey) {
       await this._createIdentity();
@@ -61,9 +74,12 @@ class OmemoEngine {
   async _createIdentity() {
     const d = this.store.data;
     const idkp = await KeyHelper.generateIdentityKeyPair();
-    const deviceId = (randBytes(4)[0] << 23) ^ (Math.floor(Math.random() * 0x7fffffff)) || 1;
+    // Cryptographically-random 31-bit device/registration id (OMEMO device ids
+    // are not secret, but use a CSPRNG and the full 4 random bytes regardless).
+    const b = randBytes(4);
+    const rand32 = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
     d.identityKey = idkp;
-    d.registrationId = Math.abs(deviceId) % 0x7fffffff || 1;
+    d.registrationId = (rand32 % 0x7fffffff) || 1;
     d.deviceId = d.registrationId;
     d.signedPreKeyId = 1;
     const spk = await KeyHelper.generateSignedPreKey(idkp, 1);

@@ -1,6 +1,6 @@
 'use strict';
 
-/* global window, document, XmppClient, UI */
+/* global window, document, XmppClient, UI, CallManager, CSS */
 
 const CONFIG = window.APP_CONFIG || {};
 const { $, el } = UI;
@@ -15,11 +15,20 @@ const state = {
   myTyping: { to: null, active: false, idle: null },
   omemo: { ready: false, available: false, deviceId: null, fingerprint: '' },
   historyBootstrapped: false,
+  roomsRestored: false,
 };
 
 /* ============================ helpers ============================ */
 
 function bare(jid) { return (jid || '').split('/')[0]; }
+
+// Russian plural: pick the form for `n` (1 участник / 2 участника / 5 участников).
+function plural(n, one, few, many) {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
+}
 
 function resolveJid(input) {
   let v = input.trim();
@@ -65,6 +74,9 @@ function getConversation(jid, opts = {}) {
       typing: false,
       encrypted: false,       // OMEMO on for this conversation
       omemoDevices: 0,        // peer device count
+      occupants: new Map(),   // MUC: nick -> { nick, role, affiliation, jid, show }
+      subject: '',            // MUC: room topic
+      myNick: '',             // MUC: our own nick in the room
     };
     state.conversations.set(key, conv);
   }
@@ -200,9 +212,25 @@ function renderBubble(conv, m, groupedTop) {
   if (conv.type === 'groupchat' && m.direction === 'in' && groupedTop) {
     bubble.appendChild(el('div', { class: 'msg-sender' }, m.nick || m.from));
   }
-  bubble.appendChild(el('div', { class: 'msg-body', html: UI.linkify(m.body, m.oobUrl) }));
+  bubble.appendChild(el('div', { class: 'msg-body', html: UI.linkify(m.body) }));
+  const imgUrl = UI.imageUrl(m.body, m.oobUrl);
+  if (imgUrl) bubble.appendChild(renderImageLoader(imgUrl));
   bubble.appendChild(meta);
   return bubble;
+}
+
+// Privacy: shared images are NOT auto-loaded (that would leak the viewer's IP
+// and read status to the sender). Show a placeholder; fetch only on click.
+function renderImageLoader(url) {
+  const wrap = el('div', { class: 'img-loader' });
+  const btn = el('button', { class: 'img-load-btn', type: 'button' }, '🖼 Показать изображение');
+  btn.addEventListener('click', () => {
+    const img = el('img', { class: 'inline-img', src: url, alt: 'image', loading: 'lazy' });
+    img.addEventListener('click', () => window.open(url, '_blank', 'noopener'));
+    wrap.replaceChildren(img);
+  });
+  wrap.appendChild(btn);
+  return wrap;
 }
 
 function updateMessageStatus(conv, key, status) {
@@ -280,6 +308,7 @@ async function openConversation(jid) {
   renderActiveMessages('bottom');
   renderConversationList();
   updateOmemoToggle(conv);
+  updateCallButtons(conv);
   ensureOmemoDevices(conv);
   $('#message-input').focus();
 
@@ -325,7 +354,9 @@ async function loadOlderHistory(conv) {
 function updatePeerStatus(conv) {
   const elx = $('#peer-status');
   if (conv.type === 'groupchat') {
-    elx.textContent = 'Групповой чат';
+    const n = conv.occupants.size;
+    const who = n ? `${n} ${plural(n, 'участник', 'участника', 'участников')}` : 'Групповой чат';
+    elx.textContent = conv.subject ? `${who} · ${conv.subject}` : who;
     elx.className = 'peer-status';
     return;
   }
@@ -474,6 +505,7 @@ function wireClient() {
     const banner = $('#conn-banner');
     if (name === 'CONNECTED' || name === 'ATTACHED') {
       banner.hidden = true;
+      restoreRooms();
       // Fallback: load history even if OMEMO events never fire.
       setTimeout(maybeBootstrapHistory, 3000);
     } else if (name === 'DISCONNECTED' || name === 'CONNFAIL') {
@@ -605,6 +637,43 @@ function wireClient() {
     conv.omemoDevices = devices.length;
     if (state.currentJid === conv.jid) updateOmemoToggle(conv);
   });
+
+  client.on('omemo-key-changed', ({ jid, deviceId }) => {
+    UI.toast(`⚠️ Ключ OMEMO изменился (устройство ${deviceId}). Это может быть переустановка клиента — или попытка перехвата. Проверьте отпечаток в «ⓘ» прежде чем доверять.`, true);
+    const conv = state.conversations.get(bare(jid));
+    if (conv && state.currentJid === conv.jid) updateOmemoToggle(conv);
+  });
+
+  /* ----- MUC (group chat) ----- */
+  client.on('muc-presence', (p) => {
+    const conv = state.conversations.get(p.room);
+    if (!conv) return;
+    if (p.nickChange && p.newNick) {
+      const occ = conv.occupants.get(p.nick);
+      conv.occupants.delete(p.nick);
+      conv.occupants.set(p.newNick, { ...(occ || {}), nick: p.newNick });
+      if (conv.myNick === p.nick) conv.myNick = p.newNick;
+    } else if (p.type === 'unavailable') {
+      conv.occupants.delete(p.nick);
+    } else {
+      conv.occupants.set(p.nick, {
+        nick: p.nick, role: p.role, affiliation: p.affiliation, jid: p.jid, show: p.show,
+      });
+      if (p.self) conv.myNick = p.nick;
+    }
+    if (state.currentJid === conv.jid) updatePeerStatus(conv);
+  });
+
+  client.on('muc-subject', ({ room, subject }) => {
+    const conv = state.conversations.get(room);
+    if (!conv) return;
+    conv.subject = subject;
+    if (state.currentJid === conv.jid) updatePeerStatus(conv);
+  });
+
+  client.on('call-signal', (sig) => {
+    if (window.callManager) window.callManager.onSignal(sig);
+  });
 }
 
 function maybeBootstrapHistory() {
@@ -655,6 +724,13 @@ function updateOmemoToggle(conv) {
   btn.title = conv.encrypted
     ? 'OMEMO включён — нажмите, чтобы выключить'
     : (conv.omemoDevices ? 'Включить OMEMO' : 'OMEMO включить (у собеседника пока нет устройств OMEMO)');
+}
+
+function updateCallButtons(conv) {
+  // Calls are 1:1 only and need a secure context (getUserMedia / RTCPeerConnection).
+  const usable = !!(window.callManager && window.callManager.supported()) && conv && conv.type === 'chat';
+  $('#call-audio-btn').hidden = !usable;
+  $('#call-video-btn').hidden = !usable;
 }
 
 function toggleOmemo() {
@@ -722,6 +798,31 @@ function saveLogin(jid, wsUrl) {
   localStorage.setItem('xmppweb.login', JSON.stringify({ jid, wsUrl }));
 }
 
+/* ----- joined MUC rooms persistence (auto-rejoin after reload) ----- */
+function loadSavedRooms() {
+  try { return JSON.parse(localStorage.getItem('xmppweb.rooms') || '[]'); }
+  catch { return []; }
+}
+function persistRoom(jid, nick) {
+  const rooms = loadSavedRooms().filter((r) => r.jid !== jid);
+  rooms.push({ jid, nick });
+  localStorage.setItem('xmppweb.rooms', JSON.stringify(rooms));
+}
+function forgetRoom(jid) {
+  localStorage.setItem('xmppweb.rooms', JSON.stringify(loadSavedRooms().filter((r) => r.jid !== jid)));
+}
+function restoreRooms() {
+  if (state.roomsRestored) return;
+  state.roomsRestored = true;
+  const myNode = (client.bareJid || '').split('@')[0];
+  for (const r of loadSavedRooms()) {
+    if (!r || !r.jid) continue;
+    client.joinRoom(r.jid, r.nick || myNode);
+    getConversation(r.jid, { type: 'groupchat', name: r.jid.split('@')[0] });
+  }
+  renderConversationList();
+}
+
 function showApp() {
   $('#login-screen').hidden = true;
   $('#app').hidden = false;
@@ -781,7 +882,20 @@ function init() {
 
   wireClient();
 
+  // WebRTC call manager (signaling via XmppClient, see calls.js).
+  window.callManager = new CallManager(client, UI, {
+    iceServers: CONFIG.iceServers,
+    displayName,
+  });
+
   $('#login-form').addEventListener('submit', doLogin);
+
+  $('#call-audio-btn').addEventListener('click', () => {
+    if (state.currentJid) window.callManager.startCall(state.currentJid, false);
+  });
+  $('#call-video-btn').addEventListener('click', () => {
+    if (state.currentJid) window.callManager.startCall(state.currentJid, true);
+  });
 
   $('#logout-btn').addEventListener('click', async () => {
     const ok = await UI.confirm({ title: 'Выход', desc: 'Завершить сеанс?', okText: 'Выйти', danger: true });
@@ -858,6 +972,7 @@ function init() {
       if (!room.includes('@') && CONFIG.mucService) room = `${room}@${CONFIG.mucService}`;
       const nick = res.nick || (client.bareJid || '').split('@')[0];
       client.joinRoom(room, nick);
+      persistRoom(room, nick);
       getConversation(room, { type: 'groupchat', name: room.split('@')[0] });
       renderConversationList();
       openConversation(room);

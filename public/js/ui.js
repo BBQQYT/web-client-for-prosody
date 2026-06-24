@@ -32,20 +32,28 @@ const UI = (() => {
 
   const URL_RE = /\bhttps?:\/\/[^\s<>"']+/gi;
   const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/i;
+  const SINGLE_URL_RE = /^https?:\/\/[^\s<>"']+$/i;
 
-  function linkify(text, oobUrl) {
-    let html = escapeHtml(text).replace(URL_RE, (u) => {
+  // Escape, then turn http(s) URLs into safe links. All HTML-significant chars
+  // are escaped BEFORE linkifying, so nothing can break out of the href or the
+  // surrounding markup, and only http/https schemes are linkified.
+  function linkify(text) {
+    return escapeHtml(text == null ? '' : text).replace(URL_RE, (u) => {
       const safe = u.replace(/"/g, '%22');
       return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${u}</a>`;
     });
-    // Inline preview for image links shared via HTTP upload / OOB.
-    const imgUrl = (oobUrl && IMG_RE.test(oobUrl)) ? oobUrl
-      : (IMG_RE.test(text.trim()) && URL_RE.test(text.trim()) ? text.trim() : null);
-    if (imgUrl) {
-      const safe = escapeHtml(imgUrl).replace(/"/g, '%22');
-      html += `<img class="inline-img" src="${safe}" alt="image" loading="lazy" />`;
-    }
-    return html;
+  }
+
+  // Detect an image URL worth previewing (from an OOB share or a bare image
+  // link). Uses a non-global regex so there is no stateful lastIndex footgun.
+  // The actual <img> is only loaded on user click (see app.js) to avoid leaking
+  // the viewer's IP / read status to whoever sent the link.
+  function imageUrl(text, oobUrl) {
+    const oob = (oobUrl || '').trim();
+    if (oob && SINGLE_URL_RE.test(oob) && IMG_RE.test(oob)) return oob;
+    const t = (text || '').trim();
+    if (SINGLE_URL_RE.test(t) && IMG_RE.test(t)) return t;
+    return '';
   }
 
   function initials(name) {
@@ -148,7 +156,7 @@ const UI = (() => {
   }
 
   return {
-    $, $$, el, escapeHtml, linkify, initials, formatTime, formatDay, dayKey,
+    $, $$, el, escapeHtml, linkify, imageUrl, initials, formatTime, formatDay, dayKey,
     toast, modalForm, confirm,
   };
 })();
