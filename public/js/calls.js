@@ -3,36 +3,37 @@
 /* global window, document, navigator, RTCPeerConnection, MediaStream */
 
 /**
- * 1:1 audio/video calls over WebRTC.
+ * 1:1 audio/video calls over WebRTC, signaled with **Jingle** so they
+ * interoperate with Conversations / Dino / Movim:
+ *   - XEP-0353 Jingle Message Initiation (ringing: propose/proceed/reject/...)
+ *   - XEP-0166/0167/0176/0320 Jingle session (session-initiate/accept,
+ *     transport-info) — SDP <-> Jingle conversion lives in jingle-sdp.js.
  *
- * Signaling rides on XMPP messages (namespace urn:xmppweb:call:0) routed through
- * XmppClient.sendCallSignal / the 'call-signal' event. This is app-native
- * signaling (works between users of THIS client); it is not Jingle, so it does
- * not interoperate with Conversations/Dino. Media is peer-to-peer (P2P) with
- * STUN/TURN for NAT traversal — it never flows through the web server.
+ * Media is peer-to-peer (STUN/TURN for NAT traversal); it never touches the web
+ * server. Requires a secure context (HTTPS or http://localhost) for getUserMedia.
  *
- * Flow:
- *   caller  --propose-->  callee        (rings every callee device)
- *   callee  --accept --->  caller
- *   caller  --offer  --->  callee        (SDP offer, after accept)
- *   callee  --answer --->  caller        (SDP answer)
- *   both    <-candidate->  both          (trickle ICE)
- *   either  --hangup -->   other         (or reject / retract)
+ * NOTE: the SDP<->Jingle mapping is custom and best-effort; verify against a real
+ * Conversations peer. Set DEBUG=true (default) to log the signaling exchange.
  */
 
+const DEBUG = true;
 const RING_TIMEOUT_MS = 60000;
+// NOTE: classic scripts share one global scope, so we must NOT re-`const` names
+// already declared by xmpp.js (Strophe, $build). Use a private alias instead.
+const jBuild = window.strophe.$build;
 
+function log(...a) { if (DEBUG) console.debug('[jingle]', ...a); }
 function randSid() {
-  const b = window.crypto.getRandomValues(new Uint8Array(16));
+  const b = window.crypto.getRandomValues(new Uint8Array(12));
   return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 }
-
 function bareJid(jid) { return (jid || '').split('/')[0]; }
 
 class CallManager {
   constructor(client, ui, opts = {}) {
     this.client = client;
     this.ui = ui;
+    this.JS = window.JingleSDP;
     this.iceServers = (opts.iceServers && opts.iceServers.length)
       ? opts.iceServers
       : [{ urls: 'stun:stun.l.google.com:19302' }];
@@ -40,8 +41,10 @@ class CallManager {
 
     this.pc = null;
     this.localStream = null;
-    this.call = null;              // active/pending call descriptor
-    this.pendingCandidates = [];   // ICE candidates buffered before remote SDP
+    this.call = null;
+    this.remoteCandidateQueue = [];
+    this.localCandidateQueue = [];
+    this.localCreds = {};        // mid -> { ufrag, pwd }
     this.ringTimer = null;
     this.durationTimer = null;
 
@@ -51,7 +54,8 @@ class CallManager {
   get busy() { return !!this.call; }
 
   supported() {
-    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.RTCPeerConnection);
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia &&
+      window.RTCPeerConnection && this.JS);
   }
 
   /* ----------------------------- outgoing --------------------------- */
@@ -59,61 +63,91 @@ class CallManager {
   startCall(toJid, video) {
     const peerBare = bareJid(toJid);
     if (!peerBare) return;
-    if (!this.supported()) { this.ui.toast('Звонки не поддерживаются в этом браузере/контексте (нужен HTTPS)', true); return; }
+    if (!this.supported()) { this.ui.toast('Звонки недоступны (нужен HTTPS и поддержка WebRTC)', true); return; }
     if (this.busy) { this.ui.toast('Уже идёт звонок', true); return; }
 
     const sid = randSid();
-    this.call = { sid, peer: peerBare, peerBare, direction: 'out', video: !!video, state: 'calling' };
-    this.client.sendCallSignal(peerBare, 'propose', { sid, video: !!video });
+    const media = video ? ['audio', 'video'] : ['audio'];
+    this.call = {
+      sid, peer: peerBare, peerBare, direction: 'out', video: !!video,
+      state: 'calling', isInitiator: true, sessionLive: false,
+    };
+    log('propose', sid, '->', peerBare, media);
+    this.client.sendJmi(peerBare, 'propose', sid, { media });
     this._showActive('Звоним…');
-    this._armRingTimeout(() => {
-      this.client.sendCallSignal(this.call.peer, 'retract', { sid });
-      this._end('Нет ответа');
-    });
+    this._armRingTimeout(() => { this.client.sendJmi(this.call.peer, 'retract', sid); this._end('Нет ответа'); });
   }
 
-  /* --------------------------- signal intake ------------------------ */
+  /* ----------------- Jingle Message Initiation intake --------------- */
 
-  onSignal({ from, action, data }) {
-    const fromBare = bareJid(from);
-    const sid = data && data.sid;
+  onJmi({ from, fromBare, action, sid, media, mine }) {
+    log('JMI <-', action, sid, 'from', from, mine ? '(self)' : '');
 
     if (action === 'propose') {
-      if (this.busy) { this.client.sendCallSignal(from, 'reject', { sid, reason: 'busy' }); return; }
-      this.call = { sid, peer: from, peerBare: fromBare, direction: 'in', video: !!(data && data.video), state: 'ringing' };
+      if (mine) return; // our own carbon
+      if (this.busy) { this.client.sendJmi(from, 'reject', sid); return; }
+      this.call = {
+        sid, peer: from, peerBare: fromBare, direction: 'in',
+        video: (media || []).includes('video'), state: 'ringing',
+        isInitiator: false, initiator: from, sessionLive: false,
+      };
+      this.client.sendJmi(from, 'ringing', sid);
       this._showIncoming();
       this._armRingTimeout(() => this._end('Пропущенный звонок'));
       return;
     }
 
-    // All other actions must match the active call's sid.
+    // Another of OUR devices answered/declined this incoming call -> stop ringing.
+    if (mine && (action === 'accept' || action === 'reject') && this.call && this.call.sid === sid && this.call.direction === 'in') {
+      this._end('');
+      return;
+    }
+
     if (!this.call || sid !== this.call.sid) return;
 
     switch (action) {
-      case 'retract':
-        this._end('Звонок отменён');
+      case 'ringing':
+        if (this.call.state === 'calling') this._setStatus('Звонок…');
         break;
-      case 'reject':
-        this._end(data && data.reason === 'busy' ? 'Собеседник занят' : 'Звонок отклонён');
-        break;
-      case 'accept':
-        // Lock onto the device that answered and start the media handshake.
+      case 'proceed':
+        // Callee accepted; we (initiator) now create and send the offer.
         this.call.peer = from;
         this.call.state = 'connecting';
         this._clearRingTimeout();
         this._showActive('Соединение…');
-        this._beginAsCaller().catch((e) => this._fail(e));
+        this._beginOffer().catch((e) => this._fail(e));
         break;
-      case 'offer':
-        this._handleOffer(data).catch((e) => this._fail(e));
+      case 'reject':
+        this._end('Звонок отклонён');
         break;
-      case 'answer':
-        this._handleAnswer(data).catch((e) => this._fail(e));
+      case 'retract':
+        this._end('Звонок отменён');
         break;
-      case 'candidate':
-        this._handleCandidate(data);
+      default:
         break;
-      case 'hangup':
+    }
+  }
+
+  /* ----------------------- Jingle session intake -------------------- */
+
+  onJingle({ from, action, sid, jingle }) {
+    if (!this.call || sid !== this.call.sid) {
+      log('jingle for unknown sid', sid, action);
+      return;
+    }
+    log('jingle <-', action, sid);
+    switch (action) {
+      case 'session-initiate':
+        this.call.peer = from;
+        this._handleSessionInitiate(jingle).catch((e) => this._fail(e));
+        break;
+      case 'session-accept':
+        this._handleSessionAccept(jingle).catch((e) => this._fail(e));
+        break;
+      case 'transport-info':
+        this._handleTransportInfo(jingle);
+        break;
+      case 'session-terminate':
         this._end('Звонок завершён');
         break;
       default:
@@ -130,63 +164,121 @@ class CallManager {
     try {
       await this._getLocalMedia(this.call.video);
     } catch (e) { this._fail(e); return; }
-    this._setupPeer();                 // pc ready with local tracks; await caller's offer
-    this.client.sendCallSignal(this.call.peer, 'accept', { sid: this.call.sid });
+    this._setupPeer();
+    this.client.sendJmi(this.call.peer, 'proceed', this.call.sid);
+    this.client.sendJmi(this.client.bareJid, 'accept', this.call.sid); // hush our other devices
     this._showActive('Соединение…');
   }
 
   decline() {
     if (!this.call) return;
-    this.client.sendCallSignal(this.call.peer, 'reject', { sid: this.call.sid, reason: 'declined' });
+    this.client.sendJmi(this.call.peer, 'reject', this.call.sid);
+    this.client.sendJmi(this.client.bareJid, 'reject', this.call.sid);
     this._end('');
   }
 
   hangup() {
     if (!this.call) return;
-    this.client.sendCallSignal(this.call.peer, 'hangup', { sid: this.call.sid });
+    if (this.call.sessionLive) {
+      this.client.sendJingle(this.call.peer, jBuild('jingle', {
+        xmlns: this.JS.JNS.JINGLE, action: 'session-terminate', sid: this.call.sid,
+      }).c('reason').c('success')).catch(() => {});
+    } else if (this.call.direction === 'out') {
+      this.client.sendJmi(this.call.peer, 'retract', this.call.sid);
+    } else {
+      this.client.sendJmi(this.call.peer, 'reject', this.call.sid);
+    }
     this._end('');
   }
 
-  /* -------------------------- media handshake ----------------------- */
+  /* -------------------------- session setup ------------------------- */
 
-  async _beginAsCaller() {
+  async _beginOffer() {
     await this._getLocalMedia(this.call.video);
     this._setupPeer();
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
-    this.client.sendCallSignal(this.call.peer, 'offer', { sid: this.call.sid, sdp: this.pc.localDescription });
+    this._cacheLocalCreds();
+    const parsed = this.JS.parseSdp(this.pc.localDescription.sdp);
+    const jingle = this.JS.sdpToJingle(jBuild, parsed, {
+      action: 'session-initiate', sid: this.call.sid,
+      initiator: this.client.jid, creator: 'initiator',
+    });
+    log('-> session-initiate');
+    await this.client.sendJingle(this.call.peer, jingle);
+    this.call.sessionLive = true;
+    this._flushLocalCandidates();
   }
 
-  async _handleOffer(data) {
-    if (!data || !data.sdp) return;
-    if (!this.pc) { await this._getLocalMedia(this.call.video); this._setupPeer(); }
-    await this.pc.setRemoteDescription(data.sdp);
-    await this._drainCandidates();
+  async _handleSessionInitiate(jingle) {
+    const offerSdp = this.JS.jingleToSdp(jingle, { isInitiator: false });
+    await this.pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+    await this._drainRemoteCandidates();
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-    this.client.sendCallSignal(this.call.peer, 'answer', { sid: this.call.sid, sdp: this.pc.localDescription });
+    this._cacheLocalCreds();
+    const parsed = this.JS.parseSdp(this.pc.localDescription.sdp);
+    const out = this.JS.sdpToJingle(jBuild, parsed, {
+      action: 'session-accept', sid: this.call.sid,
+      initiator: this.call.initiator || this.call.peer, responder: this.client.jid,
+      creator: 'initiator',
+    });
+    log('-> session-accept');
+    await this.client.sendJingle(this.call.peer, out);
+    this.call.sessionLive = true;
+    this._flushLocalCandidates();
   }
 
-  async _handleAnswer(data) {
-    if (!this.pc || !data || !data.sdp) return;
-    await this.pc.setRemoteDescription(data.sdp);
-    await this._drainCandidates();
+  async _handleSessionAccept(jingle) {
+    const answerSdp = this.JS.jingleToSdp(jingle, { isInitiator: true });
+    await this.pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    await this._drainRemoteCandidates();
   }
 
-  _handleCandidate(data) {
-    if (!data || !data.candidate) return;
-    if (this.pc && this.pc.remoteDescription && this.pc.remoteDescription.type) {
-      this.pc.addIceCandidate(data.candidate).catch(() => {});
-    } else {
-      this.pendingCandidates.push(data.candidate);
+  _handleTransportInfo(jingle) {
+    for (const content of this.JS.kids(jingle, 'content')) {
+      const mid = content.getAttribute('name');
+      const transport = this.JS.kid(content, 'transport', this.JS.JNS.ICE);
+      if (!transport) continue;
+      for (const candEl of this.JS.kids(transport, 'candidate', this.JS.JNS.ICE)) {
+        const cand = { candidate: this.JS.jingleCandidateToSdp(candEl), sdpMid: mid };
+        if (this.pc && this.pc.remoteDescription && this.pc.remoteDescription.type) {
+          this.pc.addIceCandidate(cand).catch((e) => log('addIceCandidate failed', e && e.message));
+        } else {
+          this.remoteCandidateQueue.push(cand);
+        }
+      }
     }
   }
 
-  async _drainCandidates() {
-    const list = this.pendingCandidates;
-    this.pendingCandidates = [];
-    for (const c of list) { try { await this.pc.addIceCandidate(c); } catch (_) { /* ignore */ } }
+  async _drainRemoteCandidates() {
+    const list = this.remoteCandidateQueue;
+    this.remoteCandidateQueue = [];
+    for (const c of list) { try { await this.pc.addIceCandidate(c); } catch (e) { log('drain cand failed', e && e.message); } }
   }
+
+  _cacheLocalCreds() {
+    const parsed = this.JS.parseSdp(this.pc.localDescription.sdp);
+    for (const m of parsed.medias) this.localCreds[m.mid] = { ufrag: m.ice.ufrag, pwd: m.ice.pwd };
+  }
+
+  _flushLocalCandidates() {
+    const q = this.localCandidateQueue;
+    this.localCandidateQueue = [];
+    for (const e of q) this._sendLocalCandidate(e);
+  }
+
+  _sendLocalCandidate(e) {
+    if (!this.call) return;
+    const mid = e.sdpMid || '0';
+    const creds = this.localCreds[mid] || {};
+    const jingle = this.JS.iceCandidateToJingle(jBuild,
+      { candidate: e.candidate, sdpMid: mid },
+      { sid: this.call.sid, creator: 'initiator', ufrag: creds.ufrag, pwd: creds.pwd });
+    this.client.sendJingle(this.call.peer, jingle).catch(() => {});
+  }
+
+  /* --------------------------- media / pc --------------------------- */
 
   async _getLocalMedia(video) {
     this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: !!video });
@@ -198,11 +290,12 @@ class CallManager {
 
   _setupPeer() {
     if (this.pc) return;
-    this.pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    this.pc = new RTCPeerConnection({ iceServers: this.iceServers, bundlePolicy: 'max-bundle' });
     this.pc.onicecandidate = (e) => {
-      if (e.candidate && this.call) {
-        this.client.sendCallSignal(this.call.peer, 'candidate', { sid: this.call.sid, candidate: e.candidate.toJSON() });
-      }
+      if (!e.candidate || !e.candidate.candidate) return;
+      const entry = { candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid };
+      if (this.call && this.call.sessionLive) this._sendLocalCandidate(entry);
+      else this.localCandidateQueue.push(entry);
     };
     this.pc.ontrack = (e) => {
       const stream = (e.streams && e.streams[0]) || new MediaStream([e.track]);
@@ -210,11 +303,10 @@ class CallManager {
     };
     this.pc.onconnectionstatechange = () => {
       const st = this.pc && this.pc.connectionState;
+      log('pc state', st);
       if (st === 'connected') { this.call.state = 'active'; this._startTimer(); this._setStatus(''); }
-      else if (st === 'failed') this._fail(new Error('connection failed'));
-      else if (st === 'disconnected' || st === 'closed') {
-        if (this.call && this.call.state === 'active') this._end('Звонок завершён');
-      }
+      else if (st === 'failed') this._fail(new Error('ICE failed'));
+      else if ((st === 'disconnected' || st === 'closed') && this.call && this.call.state === 'active') this._end('Звонок завершён');
     };
     if (this.localStream) for (const t of this.localStream.getTracks()) this.pc.addTrack(t, this.localStream);
   }
@@ -222,11 +314,20 @@ class CallManager {
   /* ------------------------------ teardown -------------------------- */
 
   _fail(err) {
+    log('FAIL', err && (err.message || err.name), err);
     const name = err && err.name;
     let msg = 'Ошибка звонка';
     if (name === 'NotAllowedError' || name === 'SecurityError') msg = 'Нет доступа к камере/микрофону';
     else if (name === 'NotFoundError') msg = 'Камера или микрофон не найдены';
-    if (this.call) this.client.sendCallSignal(this.call.peer, 'hangup', { sid: this.call.sid });
+    if (this.call) {
+      if (this.call.sessionLive) {
+        this.client.sendJingle(this.call.peer, jBuild('jingle', {
+          xmlns: this.JS.JNS.JINGLE, action: 'session-terminate', sid: this.call.sid,
+        }).c('reason').c('failed-application')).catch(() => {});
+      } else {
+        this.client.sendJmi(this.call.peer, this.call.direction === 'out' ? 'retract' : 'reject', this.call.sid);
+      }
+    }
     this._end(msg, true);
   }
 
@@ -235,7 +336,9 @@ class CallManager {
     this._stopTimer();
     if (this.pc) { try { this.pc.close(); } catch (_) { /* ignore */ } this.pc = null; }
     if (this.localStream) { for (const t of this.localStream.getTracks()) t.stop(); this.localStream = null; }
-    this.pendingCandidates = [];
+    this.remoteCandidateQueue = [];
+    this.localCandidateQueue = [];
+    this.localCreds = {};
     this.call = null;
     if (this.localVideo) this.localVideo.srcObject = null;
     if (this.remoteVideo) this.remoteVideo.srcObject = null;
@@ -286,7 +389,6 @@ class CallManager {
       el('div', { class: 'call-controls' }, this.micBtn, this.camBtn, this.hangBtn),
     );
 
-    // Incoming-call prompt.
     this.incTitle = el('div', { class: 'call-inc-title' }, '');
     this.incSub = el('div', { class: 'call-inc-sub' }, '');
     const acceptBtn = el('button', { class: 'call-ctl call-accept', title: 'Принять' }, '📞');

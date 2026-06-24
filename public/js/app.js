@@ -742,9 +742,9 @@ function wireClient() {
     if (state.currentJid === conv.jid) updatePeerStatus(conv);
   });
 
-  client.on('call-signal', (sig) => {
-    if (window.callManager) window.callManager.onSignal(sig);
-  });
+  // Jingle calls (XEP-0353 ringing + XEP-0166 session).
+  client.on('jmi', (sig) => { if (window.callManager) window.callManager.onJmi(sig); });
+  client.on('jingle', (sig) => { if (window.callManager) window.callManager.onJingle(sig); });
 }
 
 function maybeBootstrapHistory() {

@@ -45,8 +45,10 @@ const NS = {
   PUBSUB_OPTIONS: 'http://jabber.org/protocol/pubsub#publish-options',
   EME: 'urn:xmpp:eme:0',
   HINTS: 'urn:xmpp:hints',
-  // App-native WebRTC call signaling (between users of this web client).
-  CALL: 'urn:xmppweb:call:0',
+  // Jingle (standards-based calls, Conversations / Dino compatible).
+  JINGLE: 'urn:xmpp:jingle:1',
+  JMI: 'urn:xmpp:jingle-message:0',
+  JINGLE_RTP: 'urn:xmpp:jingle:apps:rtp:1',
   // OMEMO (legacy axolotl — Conversations / Cheogram compatible)
   AXOLOTL: 'eu.siacs.conversations.axolotl',
   OMEMO_DEVICELIST: 'eu.siacs.conversations.axolotl.devicelist',
@@ -170,6 +172,7 @@ class XmppClient {
     this.connection.addHandler(this._onPresence.bind(this), null, 'presence');
     this.connection.addHandler(this._onRosterPush.bind(this), NS.ROSTER, 'iq', 'set');
     this.connection.addHandler(this._onVersionQuery.bind(this), NS.VERSION, 'iq', 'get');
+    this.connection.addHandler(this._onJingleIq.bind(this), NS.JINGLE, 'iq', 'set');
 
     this.enableCarbons();
     this.sendPresence();
@@ -362,11 +365,20 @@ class XmppClient {
     try {
       const stanzaFrom = stanza.getAttribute('from') || '';
 
-      // --- WebRTC call signaling (app-native) ---
-      const callEl = getChild(stanza, 'call', NS.CALL);
-      if (callEl) {
-        this._handleCallSignal(stanzaFrom, callEl);
-        return true;
+      // --- Jingle Message Initiation (XEP-0353): ring / accept / proceed ... ---
+      for (const action of ['propose', 'proceed', 'accept', 'reject', 'retract', 'ringing']) {
+        const jmi = getChild(stanza, action, NS.JMI);
+        if (jmi) {
+          this._emit('jmi', {
+            from: stanzaFrom,
+            fromBare: Strophe.getBareJidFromJid(stanzaFrom),
+            action,
+            sid: jmi.getAttribute('id'),
+            media: getChildren(jmi, 'description').map((d) => d.getAttribute('media')).filter(Boolean),
+            mine: this._isMe(stanzaFrom),
+          });
+          return true;
+        }
       }
 
       // --- PEP event (OMEMO device list updates) ---
@@ -1053,28 +1065,42 @@ class XmppClient {
     }
   }
 
-  /* ------------------------------ calls ----------------------------- */
+  /* ---- Jingle (XEP-0166/0353) for Conversations/Dino-compatible calls ---- */
 
-  /**
-   * Send a WebRTC signaling message. `to` may be a bare JID (propose — rings all
-   * the callee's devices) or a full JID (media negotiation with one device).
-   * Call signals are transient: hint the server not to store or carbon them.
-   */
-  sendCallSignal(to, action, data = {}) {
+  /** Send a Jingle Message Initiation message (propose/proceed/accept/reject/...) */
+  sendJmi(to, action, sid, { media, addressToSelf } = {}) {
     if (!this.isConnected()) return;
-    const msg = $msg({ to, type: 'chat' })
-      .c('call', { xmlns: NS.CALL, action }).t(JSON.stringify(data || {})).up()
-      .c('no-store', { xmlns: NS.HINTS }).up()
-      .c('no-copy', { xmlns: NS.HINTS }).up()
-      .c('no-permanent-store', { xmlns: NS.HINTS }).up();
+    const msg = $msg({ to, type: 'chat' }).c(action, { xmlns: NS.JMI, id: sid });
+    if (action === 'propose' && media) {
+      for (const m of media) msg.c('description', { xmlns: NS.JINGLE_RTP, media: m }).up();
+    }
+    msg.up().c('store', { xmlns: NS.HINTS }).up();
     this.connection.send(msg.tree());
   }
 
-  _handleCallSignal(from, callEl) {
-    const action = callEl.getAttribute('action') || '';
-    let data = {};
-    try { data = JSON.parse(Strophe.getText(callEl) || '{}'); } catch (_) { data = {}; }
-    this._emit('call-signal', { from, action, data });
+  /** Send a <jingle> action as an IQ-set. `jingleBuilder` is a Strophe.Builder. */
+  sendJingle(to, jingleBuilder) {
+    const iq = $iq({ type: 'set', to }).cnode(jingleBuilder.tree());
+    return this._sendIqAsync(iq);
+  }
+
+  _onJingleIq(iq) {
+    const from = iq.getAttribute('from') || '';
+    const id = iq.getAttribute('id');
+    const jingle = getChild(iq, 'jingle', NS.JINGLE);
+    // Ack immediately (Jingle is transaction-based; the real reply is a new IQ).
+    if (id) this.connection.send($iq({ type: 'result', id, to: from }));
+    if (jingle) {
+      this._emit('jingle', {
+        from,
+        fromBare: Strophe.getBareJidFromJid(from),
+        action: jingle.getAttribute('action'),
+        sid: jingle.getAttribute('sid'),
+        initiator: jingle.getAttribute('initiator') || '',
+        jingle,
+      });
+    }
+    return true;
   }
 
   /* ----------------------------- version ---------------------------- */

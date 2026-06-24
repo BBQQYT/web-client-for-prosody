@@ -141,8 +141,9 @@ Browser (public/)  ──WebSocket(SASL)──►  Prosody (mod_websocket)
   implementing the XEPs listed above.
 - `public/js/app.js` — application state + glue between XMPP events and the DOM.
 - `public/js/ui.js` — pure view helpers (DOM building, modals, toasts).
-- `public/js/calls.js` — `CallManager`: WebRTC audio/video calls with signaling
-  over XMPP messages.
+- `public/js/calls.js` — `CallManager`: WebRTC audio/video calls (Jingle
+  signaling: XEP-0353 ringing + XEP-0166 session).
+- `public/js/jingle-sdp.js` — SDP ↔ Jingle conversion (XEP-0167/0176/0320/0338).
 - `omemo/` — OMEMO sources bundled by `build.js` (esbuild) into
   `public/js/omemo.bundle.js`:
   - `omemo/store.js` — encrypted, on-device libsignal store (localStorage + AES-GCM).
@@ -189,16 +190,21 @@ published with `access_model=open` so contacts can fetch them.
 the media never flows through the web server. Call buttons (📞 / 🎥) appear in
 the chat header for direct chats.
 
-- **Signaling** rides on XMPP messages (namespace `urn:xmppweb:call:0`): propose →
-  accept/reject → SDP offer/answer → trickle ICE → hangup. These signaling
-  messages are hinted *no-store / no-copy* so they aren't archived.
-- This signaling is **app-native** — it works between users of *this* client, but
-  is **not Jingle (XEP-0166/0353)**, so it does not interoperate with
-  Conversations/Dino/Movim. (Swapping in Jingle is a possible future step.)
+- **Signaling uses Jingle**, so calls interoperate with Conversations / Dino /
+  Movim:
+  - **XEP-0353 Jingle Message Initiation** for ringing (propose → proceed /
+    reject / retract), which rings all of the callee's devices.
+  - **XEP-0166/0167/0176/0320** for the session (`session-initiate`,
+    `session-accept`, `transport-info`). The SDP ↔ Jingle conversion lives in
+    [`public/js/jingle-sdp.js`](public/js/jingle-sdp.js).
 - **NAT traversal:** a public STUN server is used by default; set `XMPP_TURN_URL`
   (+ credentials) for symmetric NATs / strict firewalls.
 - Requires a **secure context** (HTTPS, or `http://localhost`) for camera/mic
   access. The buttons are hidden if the browser can't do WebRTC.
+- The SDP↔Jingle mapping is custom (audio/video, BUNDLE, rtcp-mux, DTLS-SRTP,
+  trickle ICE). It is verified via a real WebRTC offer/answer round-trip, but the
+  exact Jingle dialect of every peer can differ — if a call fails, the browser
+  console logs the exchange under `[jingle]` (set `DEBUG` in `calls.js`).
 
 ## Security notes
 
@@ -238,8 +244,12 @@ the chat header for direct chats.
   unlocked and a new device identity is generated.
 - MUC: join/history/send/receive, occupant count and subject are supported; there
   is no full member-list / affiliation-management UI yet.
-- Calls are 1:1 only and use app-native signaling (not Jingle), so they don't
-  interoperate with other XMPP clients.
+- Calls are 1:1 only. They use Jingle (XEP-0166/0353) and should interoperate
+  with Conversations/Dino, but the SDP↔Jingle mapping is best-effort — verify
+  with your actual peer and check the `[jingle]` console logs if a call fails.
+- Sending **outgoing** files is not yet end-to-end encrypted (`aesgcm://`):
+  incoming OMEMO `aesgcm://` attachments are fetched & decrypted for display, but
+  this client uploads its own shared files unencrypted (link sent over OMEMO).
 
 ## License
 
